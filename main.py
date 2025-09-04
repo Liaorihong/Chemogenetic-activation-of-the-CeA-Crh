@@ -1,503 +1,352 @@
 import pandas as pd
-import numpy as np
+from shapely.geometry import Polygon, MultiPolygon, Point
 import matplotlib.pyplot as plt
-from matplotlib.widgets import RectangleSelector
-import cv2  # Used for reading video frames
-import os  # Used for path operations
-import matplotlib  # Used for font configuration
+import json
+import os
+import numpy as np # 确保导入了numpy，虽然可能已经有了
 
-matplotlib.use('TkAgg')  # Or 'QtAgg', 'WXAgg' depending on your backend preference
+# --- 数据准备与理解部分 ---
+# (这部分应该与你之前main.py中的代码相同，确保数据加载和列清理正确)
 
-# --- Configure matplotlib for Chinese display ---
-# Replace with the path or name of a Chinese TrueType font on your system
-# e.g., 'SimHei', 'Microsoft YaHei', 'PingFang SC', 'WenQuanYi Zen Hei'
-# You can also specify the full font path, e.g., 'C:/Windows/Fonts/simhei.ttf'
-font_path = 'SimHei'  # Attempt to use a common black body in the system
-
+# 加载数据
 try:
-    matplotlib.rcParams['font.sans-serif'] = [font_path,
-                                              'DejaVu Sans']  # Prioritize Chinese font, fallback to DejaVu Sans
-    matplotlib.rcParams['axes.unicode_minus'] = False  # Resolve the issue of negative signs displaying as squares
-    print(f"Matplotlib font set to: {matplotlib.rcParams['font.sans-serif']}")
-except Exception as e:
-    print(f"Warning: Failed to set Matplotlib font, possibly because font '{font_path}' does not exist. Error: {e}")
-    print("Please manually check if the font exists on your system, or try other font names/paths.")
-# --- End font configuration ---
+    df = pd.read_csv('25.1.3 CNO CeA #6 Cage2DLC_resnet50_EPMJul23shuffle1_15000_filtered.csv', header=[1, 2])
+    print("数据加载成功！")
+except FileNotFoundError:
+    print("错误：数据文件未找到。请确保CSV文件与脚本在同一目录下，或者提供正确的文件路径。")
+    exit()
 
+# 清理列名，使其更易于访问
+bodyparts = df.columns.get_level_values(0).unique().tolist()
+if 'scorer' in bodyparts:
+    bodyparts.remove('scorer')
 
-# --- Configuration Parameters ---
-fps = 50  # Frames per second
-likelihood_threshold = 0.60  # Likelihood threshold, points below this value will be filtered out
+# 创建一个新的DataFrame，简化列名
+df.columns = ['_'.join(col).strip() for col in df.columns.values]
+df = df.iloc[2:] # 移除前两行，它们是scorer和bodyparts的描述
+df = df.apply(pd.to_numeric, errors='coerce') # 将数据转换为数值类型
+df.reset_index(drop=True, inplace=True) # 重置索引
 
-# Video file associated with the CSV (needed for ROI selection)
-video_file = r"D:\CeA Crh Microbio\Day11 OFT\DJI_20250708171042_0021_D.MP4" # Example video path -
-# IMPORTANT: You need to set this path!
-file_to_analyze = r"D:\CeA Crh Microbio\Day -1 OFT\19DLC_resnet50_third trialJul21shuffle1_12000_el.csv"  # Example CSV path
+# --- 计算小鼠身体重心 (使用 nose 和 neck_base 的简单平均) ---
+selected_body_parts_for_average = ['nose', 'neck_base']
 
-# --- Body Part Column Name Mapping ---
-# *** IMPORTANT: Ensure these map correctly to your DeepLabCut CSV file's second header row. ***
-# If your CSV uses 'nose', 'bodycenter', 'tailbase' directly, then map them as such.
-# If it uses 'bodypart1', 'bodypart2', 'bodypart3', then map them accordingly.
-BODYPART_COLUMN_MAP = {
-    'nose': 'bodypart1',  # Assuming 'bodypart1' in CSV is nose
-    'bodycenter': 'bodypart2',  # Assuming 'bodypart2' in CSV is bodycenter
-    'tailbase': 'bodypart3',  # Assuming 'bodypart3' in CSV is tailbase
-}
+# 检查所有必需的列是否存在
+required_x_cols = [f'{part}_x' for part in selected_body_parts_for_average]
+required_y_cols = [f'{part}_y' for part in selected_body_parts_for_average]
+missing_cols = [col for col in required_x_cols + required_y_cols if col not in df.columns]
 
-
-# --- Helper Function: Get individual's frame-by-frame status in a zone ---
-def get_individual_zone_status(df_data, individual_prefix, zone_details, bodyparts_to_consider_for_centroid,
-                               likelihood_threshold):
-    """
-    Calculates the frame-by-frame centroid coordinates and in-zone boolean status for a single animal
-    using a prioritized fallback logic for centroid calculation.
-
-    Args:
-        df_data (pd.DataFrame): DataFrame containing DeepLabCut tracking data (already filtered by analysis time).
-        individual_prefix (str): Prefix for the animal (e.g., 'individual1').
-        zone_details (dict): Dictionary containing zone 'x_min', 'x_max', 'y_min', 'y_max'.
-        bodyparts_to_consider_for_centroid (list): List of body part names to potentially use for centroid calculation.
-                                                    Should be ['nose', 'bodycenter', 'tailbase'] for this logic.
-        likelihood_threshold (float): Likelihood threshold.
-
-    Returns:
-        tuple: (pd.Series, pd.Series, pd.Series, list) containing centroid x-coordinates, y-coordinates,
-               in-zone boolean Series, and list of original frame indices.
-               Returns empty Series and list if no valid data.
-    """
-    centroid_x_coords = []
-    centroid_y_coords = []
-    centroid_likelihoods = []
-
-    # Expected body parts for the specific fallback logic
-    NOSE_KEY = 'nose'
-    BODYCENTER_KEY = 'bodycenter'
-    TAILBASE_KEY = 'tailbase'
-
-    for index, _ in df_data.iterrows():
-        # Store valid body part coordinates for the current frame
-        valid_bp_data = {}  # {bp_name: {'x': x_val, 'y': y_val, 'likelihood': l_val}}
-
-        # 1. Collect valid data for all relevant body parts in the current frame
-        for bp_name in bodyparts_to_consider_for_centroid:
-            bp_col_prefix = BODYPART_COLUMN_MAP.get(bp_name)
-            if bp_col_prefix is None:
-                continue
-
-            try:
-                x_val = pd.to_numeric(df_data.loc[index, (individual_prefix, bp_col_prefix)], errors='coerce')
-                y_val = pd.to_numeric(df_data.loc[index, (individual_prefix, f'{bp_col_prefix}.1')], errors='coerce')
-                likelihood_val = pd.to_numeric(df_data.loc[index, (individual_prefix, f'{bp_col_prefix}.2')],
-                                               errors='coerce')
-
-                if pd.notna(x_val) and pd.notna(y_val) and pd.notna(
-                        likelihood_val) and likelihood_val >= likelihood_threshold:
-                    valid_bp_data[bp_name] = {'x': x_val, 'y': y_val, 'likelihood': likelihood_val}
-            except KeyError:
-                pass  # Column not found for this individual/body part
-            except Exception as e:
-                print(f"Warning: Unknown error reading {individual_prefix}'s {bp_name} data at frame {index}: {e}")
-
-        # 2. Apply fallback logic to calculate centroid for the current frame
-        current_centroid_x, current_centroid_y, current_centroid_likelihood = np.nan, np.nan, np.nan
-
-        # Priority 1: Nose AND Bodycenter exist
-        if NOSE_KEY in valid_bp_data and BODYCENTER_KEY in valid_bp_data:
-            x_vals = [valid_bp_data[NOSE_KEY]['x'], valid_bp_data[BODYCENTER_KEY]['x']]
-            y_vals = [valid_bp_data[NOSE_KEY]['y'], valid_bp_data[BODYCENTER_KEY]['y']]
-            l_vals = [valid_bp_data[NOSE_KEY]['likelihood'], valid_bp_data[BODYCENTER_KEY]['likelihood']]
-            current_centroid_x = np.mean(x_vals)
-            current_centroid_y = np.mean(y_vals)
-            current_centroid_likelihood = np.mean(l_vals)
-        # Priority 2: Only Nose exists
-        elif NOSE_KEY in valid_bp_data:
-            current_centroid_x = valid_bp_data[NOSE_KEY]['x']
-            current_centroid_y = valid_bp_data[NOSE_KEY]['y']
-            current_centroid_likelihood = valid_bp_data[NOSE_KEY]['likelihood']
-        # Priority 3: Bodycenter AND Tailbase exist (and nose does not)
-        elif BODYCENTER_KEY in valid_bp_data and TAILBASE_KEY in valid_bp_data:
-            x_vals = [valid_bp_data[BODYCENTER_KEY]['x'], valid_bp_data[TAILBASE_KEY]['x']]
-            y_vals = [valid_bp_data[BODYCENTER_KEY]['y'], valid_bp_data[TAILBASE_KEY]['y']]
-            l_vals = [valid_bp_data[BODYCENTER_KEY]['likelihood'], valid_bp_data[TAILBASE_KEY]['likelihood']]
-            current_centroid_x = np.mean(x_vals)
-            current_centroid_y = np.mean(y_vals)
-            current_centroid_likelihood = np.mean(l_vals)
-        # Fallback: No sufficient valid points
-        else:
-            # Centroid remains NaN
-            pass
-
-        centroid_x_coords.append(current_centroid_x)
-        centroid_y_coords.append(current_centroid_y)
-        centroid_likelihoods.append(current_centroid_likelihood)
-
-    x_coords = pd.Series(centroid_x_coords, index=df_data.index)
-    y_coords = pd.Series(centroid_y_coords, index=df_data.index)
-    likelihoods = pd.Series(centroid_likelihoods, index=df_data.index)
-
-    valid_data_mask = x_coords.notna() & y_coords.notna() & likelihoods.notna()
-
-    x_coords_cleaned = x_coords[valid_data_mask]
-    y_coords_cleaned = y_coords[valid_data_mask]
-    likelihoods_cleaned = likelihoods[valid_data_mask]
-
-    cleaned_rows = len(x_coords_cleaned)
-    original_frame_indices = x_coords_cleaned.index.to_list()
-
-    if cleaned_rows == 0:
-        return pd.Series(dtype='float64'), pd.Series(dtype='float64'), pd.Series(dtype='bool'), []
-
-    in_zone = (x_coords_cleaned >= zone_details["x_min"]) & \
-              (x_coords_cleaned <= zone_details["x_max"]) & \
-              (y_coords_cleaned >= zone_details["y_min"]) & \
-              (y_coords_cleaned <= zone_details["y_max"])
-
-    return x_coords_cleaned, y_coords_cleaned, in_zone, original_frame_indices
-
-
-# --- Main function: Calculate individual dwelling time in a zone (now receives in_zone mask) ---
-def calculate_zone_dwelling_time(in_zone_mask, original_frame_indices, fps, individual_prefix, zone_display_name):
-    """
-    Calculates the dwelling time for an individual in a specific zone based on the given in_zone mask
-    and original frame indices.
-
-    Args:
-        in_zone_mask (pd.Series): Boolean Series indicating whether the individual is in the zone for each frame.
-        original_frame_indices (list): List of original frame indices corresponding to in_zone_mask.
-        fps (int): Frames per second.
-        individual_prefix (str): Prefix for the animal (e.g., 'individual1').
-        zone_display_name (str): Display name for the zone (for print output).
-
-    Returns:
-        tuple: (pd.DataFrame, float) containing a DataFrame of entry and dwelling times, and total dwelling time in seconds.
-    """
-    print(f"\n--- Analyzing {individual_prefix} in {zone_display_name} ---")
-
-    entry_times_frames = []
-    entry_times_seconds = []
-    duration_frames = []
-    duration_seconds = []
-
-    is_in_zone = False
-    current_entry_frame = 0
-
-    # Ensure original_frame_indices is not empty
-    if not original_frame_indices:
-        print(f"No valid frames for {individual_prefix} in {zone_display_name}.")
-        return pd.DataFrame(), 0.0
-
-    for i, status in enumerate(in_zone_mask):
-        # This check should ideally not be needed if in_zone_mask and original_frame_indices are always aligned
-        if i >= len(original_frame_indices):
-            print(f"original_frame_indices out of bounds at i={i}. Skipping.")
-            continue
-
-        current_original_frame = original_frame_indices[i]
-
-        if status and not is_in_zone:
-            is_in_zone = True
-            current_entry_frame = current_original_frame
-            entry_times_frames.append(current_entry_frame)
-            entry_times_seconds.append(current_entry_frame / fps)
-        elif not status and is_in_zone:
-            is_in_zone = False
-            duration_frames.append(current_original_frame - current_entry_frame)
-            duration_seconds.append((current_original_frame - current_entry_frame) / fps)
-
-    if is_in_zone:  # If still in zone at the end of data
-        last_frame_original_index = original_frame_indices[-1]
-        duration_frames.append(last_frame_original_index - current_entry_frame + 1)
-        duration_seconds.append((last_frame_original_index - current_entry_frame + 1) / fps)
-
-    results_df = pd.DataFrame({
-        '进入帧': entry_times_frames,
-        '进入时间 (s)': entry_times_seconds,
-        '持续帧数': duration_frames,
-        '持续时间 (s)': duration_seconds
-    })
-
-    total_time_in_zone_seconds = results_df['持续时间 (s)'].sum()
-    print(results_df.to_string(index=False))
-    print(f"总计在 {zone_display_name} 停留时间： {total_time_in_zone_seconds:.2f} 秒")
-
-    return results_df, total_time_in_zone_seconds
-
-
-# --- GUI function for ROI selection (unique and complete version) ---
-def select_roi(video_path, frame_to_capture=1000):
-    """
-    Captures an image from a specific frame of the specified video and allows the user to select a
-    rectangular ROI by clicking two diagonal points. Returns the coordinates of the selected rectangle
-    (x_min, y_min, x_max, y_max).
-    """
-    print(f"Attempting to open video file: {video_path}")
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"Error: Unable to open video file {video_path}. Please check the path and if the file exists.")
-        return None
-
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_to_capture)
-    ret, frame = cap.read()
-    cap.release()
-
-    if not ret:
-        print(
-            f"Error: Unable to read frame {frame_to_capture} of the video. The frame number might be out of total video frames or video opening failed.")
-        return None
-
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    fig, ax = plt.subplots()
-    ax.imshow(frame_rgb)
-    ax.set_title(f"On video frame {frame_to_capture}: Please click two diagonal points to define the open field.")
-    plt.axis('off')
-
-    clicked_points = []
-    final_roi_coords = None
-    temp_rect_patch = None  # For drawing temporary rectangle
-
-    def onclick(event):
-        nonlocal clicked_points, final_roi_coords, temp_rect_patch
-        print(
-            f"Mouse click event occurred: button={event.button}, xdata={event.xdata}, ydata={event.ydata}, inaxes={event.inaxes}")
-
-        if event.inaxes != ax:
-            print("Click not within image area, ignoring.")
-            return
-
-        if event.button == 1:  # Left mouse button click
-            x, y = event.xdata, event.ydata
-            if x is None or y is None:
-                print("Invalid click position (None).")
-                return
-
-            clicked_points.append((x, y))
-            print(f"Captured click point {len(clicked_points)}: ({x:.0f}, {y:.0f})")
-
-            # Clear old drawn points, ensure only current click or final rectangle is shown
-            for artist in ax.lines:
-                artist.remove()
-            if temp_rect_patch:
-                temp_rect_patch.remove()
-
-            if len(clicked_points) == 1:
-                ax.plot(x, y, 'ro', markersize=2)  # Draw the first click point
-                fig.canvas.draw_idle()
-                print("First click point drawn.")
-            elif len(clicked_points) == 2:
-                x_coords = [p[0] for p in clicked_points]
-                y_coords = [p[1] for p in clicked_points]
-
-                x_min, x_max = min(x_coords), max(x_coords)
-                y_min, y_max = min(y_coords), max(y_coords)
-
-                final_roi_coords = (x_min, y_min, x_max, y_max)
-                print(f"Final ROI selected: {final_roi_coords}")
-
-                # Draw final rectangle
-                temp_rect_patch = plt.Rectangle((x_min, y_min), x_max - x_min, y_max - y_min,
-                                                fill=False, edgecolor='red', linewidth=2)
-                ax.add_patch(temp_rect_patch)
-                fig.canvas.draw_idle()
-                print("Final ROI rectangle drawn.")
-
-                # Close the figure
-                plt.close(fig)
-                print("Figure closed.")
-
-    cid = fig.canvas.mpl_connect('button_press_event', onclick)
-    print("Mouse click event connected. Waiting for clicks...")
-    plt.show()
-
-    fig.canvas.mpl_disconnect(cid)
-    print("Mouse click event disconnected.")
-
-    if final_roi_coords:
-        print(f"select_roi function returns ROI: {final_roi_coords}")
+if missing_cols:
+    print(f"警告：DataFrame中缺少用于计算重心的以下列：{missing_cols}。")
+    if 'neck_base_x' in df.columns and 'neck_base_y' in df.columns:
+        print("将回退到仅使用 'neck_base' 作为小鼠位置。")
+        mouse_x = df['neck_base_x']
+        mouse_y = df['neck_base_y']
+        likelihood = df['neck_base_likelihood']
+        print(f"\n小鼠位置数据 (回退到仅使用 neck_base):")
     else:
-        print("select_roi function returns None (ROI not selected).")
-    return final_roi_coords
-
-
-# --- Main Program Starts ---
-if __name__ == "__main__":
-    # 1. User selects Open Field ROI, now taking screenshot from frame 1000
-    print("Please draw a rectangle for the open field on the displayed video frame 1000.")
-    open_field_roi = select_roi(video_file, frame_to_capture=1000)  # Ensure the correct select_roi is called here
-
-    if open_field_roi is None:
-        print("No ROI selected. Exiting.")
+        print("错误：没有足够的身体点（nose 或 neck_base）来计算小鼠位置。请检查数据。")
         exit()
+else:
+    points_to_average_x = df[required_x_cols]
+    points_to_average_y = df[required_y_cols]
 
-    of_x_min, of_y_min, of_x_max, of_y_max = open_field_roi
-    print(f"\nSelected Open Field ROI: X({of_x_min:.0f}-{of_x_max:.0f}), Y({of_y_min:.0f}-{of_y_max:.0f})")
+    mouse_x = points_to_average_x.mean(axis=1)
+    mouse_y = points_to_average_y.mean(axis=1)
+    likelihood = df['neck_base_likelihood'] # 仍然使用 neck_base 的置信度作为代表
 
-    # Calculate the center 1/4 area
-    of_width = of_x_max - of_x_min
-    of_height = of_y_max - of_y_min
+    print(f"\n小鼠位置数据 (身体重心 - {selected_body_parts_for_average} 的简单平均):")
 
-    center_x_min = of_x_min + of_width / 4
-    center_x_max = of_x_max - of_width / 4
-    center_y_min = of_y_min + of_height / 4
-    center_y_max = of_y_max - of_height / 4
+print(f"X坐标前5行:\n{mouse_x.head()}")
+print(f"Y坐标前5行:\n{mouse_y.head()}")
+print(f"置信度前5行:\n{likelihood.head()}")
 
-    # Dynamically define 'zones' dictionary for the center area
-    zones = {
-        "中心区域": {  # Center Zone
-            "x_min": int(center_x_min), "x_max": int(center_x_max),
-            "y_min": int(center_y_min), "y_max": int(center_y_max)
-        }
-    }
-    print(f"Calculated center 1/4 area: X({zones['中心区域']['x_min']}-{zones['中心区域']['x_max']}), "
-          f"Y({zones['中心区域']['y_min']}-{zones['中心区域']['y_max']})")
+# --- ROI 加载与定义逻辑 ---
+# 定义ROI配置文件路径
+ROI_CONFIG_FILE = 'epm_rois.json'
 
-    # 2. User defines analysis time range
-    while True:
+def load_rois_from_json(filename):
+    """
+    从JSON文件加载ROI定义。
+    假设 roi.py 已经将 ROI 坐标保存为原始视频分辨率的坐标。
+    """
+    if os.path.exists(filename):
         try:
-            analysis_start_time_sec = float(
-                input("\n请输入分析开始时间 (秒): "))  # Please enter analysis start time (seconds)
-            analysis_end_time_sec = float(
-                input("请输入分析结束时间 (秒): "))  # Please enter analysis end time (seconds)
-            if analysis_start_time_sec >= 0 and analysis_end_time_sec > analysis_start_time_sec:
-                break
-            else:
-                print(
-                    "无效的时间输入。开始时间必须非负，结束时间必须大于开始时间。")  # Invalid time input. Start time must be non-negative, end time must be greater than start time.
-        except ValueError:
-            print("无效输入。请输入一个数字。")  # Invalid input. Please enter a number.
+            with open(filename, 'r') as f:
+                rois = json.load(f)
+            print(f"ROI definitions loaded from {filename}")
+            return rois
+        except json.JSONDecodeError:
+            print(f"错误：ROI配置文件 '{filename}' 损坏或格式不正确。请重新运行 'roi.py' 定义ROI。")
+            raise FileNotFoundError(f"ROI file '{filename}' corrupted. Please run roi.py first.")
+    else:
+        print(f"错误：ROI配置文件 '{filename}' 不存在。请先单独运行 'roi.py' 脚本来定义你的 ROIs。")
+        raise FileNotFoundError(f"ROI file '{filename}' not found. Please run roi.py first.")
 
+# 加载ROI，如果文件不存在或损坏，程序将在此处退出
+try:
+    loaded_rois = load_rois_from_json(ROI_CONFIG_FILE)
+except FileNotFoundError:
+    exit()
+
+# 从加载的字典中创建 Shapely Polygon 对象
+# 这些ROI坐标现在应该已经是原始视频分辨率的坐标了
+center_zone_polygon = None
+if "center_zone" in loaded_rois and loaded_rois["center_zone"]:
+    center_zone_polygon = Polygon(loaded_rois["center_zone"])
+else:
+    print("警告：'center_zone' ROI 未在JSON中找到或为空。")
+
+open_arm1_polygon = None
+if "open_arm1" in loaded_rois and loaded_rois["open_arm1"]:
+    open_arm1_polygon = Polygon(loaded_rois["open_arm1"])
+else:
+    print("警告：'open_arm1' ROI 未在JSON中找到或为空。")
+
+open_arm2_polygon = None
+if "open_arm2" in loaded_rois and loaded_rois["open_arm2"]:
+    open_arm2_polygon = Polygon(loaded_rois["open_arm2"])
+else:
+    print("警告：'open_arm2' ROI 未在JSON中找到或为空。")
+
+# 合并开放臂为一个 MultiPolygon
+open_arms_polygons = []
+if open_arm1_polygon:
+    open_arms_polygons.append(open_arm1_polygon)
+if open_arm2_polygon:
+    open_arms_polygons.append(open_arm2_polygon)
+
+open_arm_combined_polygon = None
+if open_arms_polygons:
+    if len(open_arms_polygons) > 1:
+        open_arm_combined_polygon = MultiPolygon(open_arms_polygons)
+    else:
+        open_arm_combined_polygon = open_arms_polygons[0]
+else:
+    print("警告: 没有定义开放臂ROI。")
+
+
+print("\nROI Polygon 对象创建完成：")
+if center_zone_polygon:
+    print(f"中心区多边形: {list(center_zone_polygon.exterior.coords)}")
+if open_arm1_polygon:
+    print(f"开放臂1多边形: {list(open_arm1_polygon.exterior.coords)}")
+if open_arm2_polygon:
+    print(f"开放臂2多边形: {list(open_arm2_polygon.exterior.coords)}")
+
+
+# --- 可视化ROI并加入小鼠运动轨迹 ---
+plt.figure(figsize=(12, 10))
+
+# 绘制ROI区域的边框
+if center_zone_polygon:
+    plt.plot(*center_zone_polygon.exterior.xy, color='blue', linewidth=2, label='Center Zone')
+if open_arm1_polygon:
+    plt.plot(*open_arm1_polygon.exterior.xy, color='red', linewidth=2, label='Open Arm 1')
+if open_arm2_polygon:
+    plt.plot(*open_arm2_polygon.exterior.xy, color='red', linewidth=2, label='Open Arm 2')
+
+# --- 加入小鼠完整运动轨迹的绘制 (直接使用原始 mouse_x, mouse_y 坐标) ---
+# 注意：这里不再进行任何缩放
+valid_trajectory_mask = mouse_x.notna() & mouse_y.notna()
+plt.plot(mouse_x[valid_trajectory_mask], mouse_y[valid_trajectory_mask],
+         color='gray', linewidth=0.5, alpha=0.7, label='Mouse Trajectory')
+
+plt.xlabel('X Coordinate (Original Video Resolution)')
+plt.ylabel('Y Coordinate (Original Video Resolution)')
+plt.title('Elevated Plus Maze ROIs and Mouse Trajectory (Original Resolution)')
+plt.legend()
+plt.grid(True)
+plt.gca().set_aspect('equal', adjustable='box')
+
+# 调整X和Y轴的显示范围，现在应该基于原始视频分辨率的坐标来计算
+# 理想情况下，这应该匹配原始视频的宽高。
+# 你可以手动设置，或者从视频文件中读取（如果需要更动态的）。
+# 暂时用一个合理的默认值或从轨迹/ROI中找到最大最小值。
+# 为了确保轨迹和ROI都在视图中，我们取它们所有坐标的最大最小值
+all_x_coords = np.array([])
+all_y_coords = np.array([])
+
+if len(mouse_x[valid_trajectory_mask]) > 0:
+    all_x_coords = np.append(all_x_coords, mouse_x[valid_trajectory_mask].dropna().values)
+    all_y_coords = np.append(all_y_coords, mouse_y[valid_trajectory_mask].dropna().values)
+
+if center_zone_polygon:
+    all_x_coords = np.append(all_x_coords, center_zone_polygon.exterior.xy[0].tolist())
+    all_y_coords = np.append(all_y_coords, center_zone_polygon.exterior.xy[1].tolist())
+if open_arm1_polygon:
+    all_x_coords = np.append(all_x_coords, open_arm1_polygon.exterior.xy[0].tolist())
+    all_y_coords = np.append(all_y_coords, open_arm1_polygon.exterior.xy[1].tolist())
+if open_arm2_polygon:
+    all_x_coords = np.append(all_x_coords, open_arm2_polygon.exterior.xy[0].tolist())
+    all_y_coords = np.append(all_y_coords, open_arm2_polygon.exterior.xy[1].tolist())
+
+all_x_coords = all_x_coords[np.isfinite(all_x_coords)]
+all_y_coords = all_y_coords[np.isfinite(all_y_coords)]
+
+
+if len(all_x_coords) > 0 and len(all_y_coords) > 0:
+    # 增加一些边距，确保所有内容都可见
+    x_min, x_max = all_x_coords.min() - 50, all_x_coords.max() + 50
+    y_min, y_max = all_y_coords.min() - 50, all_y_coords.max() + 50
+    plt.xlim(x_min, x_max)
+    plt.ylim(y_min, y_max)
+else:
+    print("警告：无法自动设置绘图边界，因为没有有效的轨迹或ROI坐标。请检查数据。")
+
+plt.show()
+
+# --- 判断小鼠位置与ROI关系 (直接使用原始 mouse_x 和 mouse_y 坐标) ---
+def is_in_roi(x, y, polygon):
+    if pd.isna(x) or pd.isna(y) or polygon is None:
+        return False
+    point = Point(x, y)
+    return polygon.contains(point)
+
+# 应用函数到DataFrame，创建新的列标记小鼠是否在各个区域内
+# 这里直接使用原始的 mouse_x 和 mouse_y
+df['in_center_zone'] = df.apply(lambda row: is_in_roi(mouse_x.loc[row.name], mouse_y.loc[row.name], center_zone_polygon), axis=1)
+df['in_open_arm'] = df.apply(lambda row: is_in_roi(mouse_x.loc[row.name], mouse_y.loc[row.name], open_arm_combined_polygon), axis=1)
+
+
+print("\n小鼠在ROI中的标记 (前5行):")
+# 打印原始的重心坐标和判断结果，方便核对
+print(df[['in_center_zone', 'in_open_arm']].head())
+for i in range(min(5, len(df))):
+    print(f"帧 {i}: 重心({mouse_x.iloc[i]:.2f}, {mouse_y.iloc[i]:.2f}), "
+          f"在中心区: {df['in_center_zone'].iloc[i]}, 在开放臂: {df['in_open_arm'].iloc[i]}")
+
+# --- 记录进入中心区和开放臂的时间 ---
+fps = 30 # 假设视频帧率 (Frames Per Second)
+frame_interval_sec = 1 / fps
+# ... (main.py 文件中，直到计算 fps 和 frame_interval_sec 的部分保持不变) ...
+
+
+
+# --- 新增部分：从用户读取分析时间范围 ---
+analysis_start_sec = 0
+analysis_end_sec = float('inf') # 默认到视频结束
+
+while True:
+    start_input = input("\n请输入分析的起始时间 (秒)，留空表示从0秒开始: ")
+    if start_input == '':
+        analysis_start_sec = 0
+        break
     try:
-        df = pd.read_csv(file_to_analyze, header=[1, 2])
-    except FileNotFoundError:
-        print(
-            f"错误：文件 '{file_to_analyze}' 未找到。请确保文件路径正确。")  # Error: File '{file_to_analyze}' not found. Please ensure the file path is correct.
-        exit()
-    except Exception as e:
-        print(f"读取CSV文件时发生错误：{e}")  # Error reading CSV file: {e}
-        print(
-            "请检查CSV文件的格式或尝试不同的 header 参数。")  # Please check the CSV file format or try different header parameters.
-        try:
-            temp_df_header = pd.read_csv(file_to_analyze, nrows=3, header=None)
-            print(
-                "\nCSV文件前几行的原始内容（用于调试列名）：")  # Original content of the first few lines of the CSV file (for debugging column names):
-            print(temp_df_header.to_string(index=False, header=False))
-        except:
-            pass
-        exit()
+        analysis_start_sec = float(start_input)
+        if analysis_start_sec < 0:
+            print("起始时间不能为负数，请重新输入。")
+        else:
+            break
+    except ValueError:
+        print("输入无效，请输入一个数字。")
 
-    print(
-        f"\n========== 开始分析文件: {file_to_analyze} ==========")  # ========== Starting analysis of file: {file_to_analyze} ==========
-    print(
-        f"分析时间段: {analysis_start_time_sec:.2f}秒 到 {analysis_end_time_sec:.2f}秒")  # Analysis period: {analysis_start_time_sec:.2f}s to {analysis_end_time_sec:.2f}s
+while True:
+    end_input = input("请输入分析的结束时间 (秒)，留空表示到视频结束: ")
+    if end_input == '':
+        # 如果留空，则计算总帧数对应的总时间作为结束时间
+        # 确保 df 此时已经加载
+        analysis_end_sec = len(df) * frame_interval_sec
+        break
+    try:
+        analysis_end_sec = float(end_input)
+        if analysis_end_sec <= analysis_start_sec:
+            print(f"结束时间必须大于起始时间 ({analysis_start_sec:.2f}秒)，请重新输入。")
+        else:
+            break
+    except ValueError:
+        print("输入无效，请输入一个数字。")
 
-    # Filter DataFrame by analysis time
-    start_frame = int(analysis_start_time_sec * fps)
-    end_frame = int(analysis_end_time_sec * fps)
-    df_filtered = df.iloc[start_frame:end_frame].copy()
+print(f"\n将分析从 {analysis_start_sec:.2f} 秒到 {analysis_end_sec:.2f} 秒的数据。")
 
-    if df_filtered.empty:
-        print(
-            "在指定分析时间范围内没有可用数据。退出。")  # No data available within the specified analysis time range. Exiting.
-        exit()
+# 将时间范围转换为帧索引
+start_frame_index = int(analysis_start_sec * fps)
+end_frame_index = int(analysis_end_sec * fps)
 
-    # *** IMPORTANT UPDATE: List all body parts to consider for centroid calculation ***
-    # These names correspond to the keys in BODYPART_COLUMN_MAP.
-    bodyparts_to_consider_for_each_individual = ['nose', 'bodycenter', 'tailbase']
+# 确保索引在DataFrame的有效范围内
+start_frame_index = max(0, start_frame_index)
+end_frame_index = min(len(df), end_frame_index)
 
-    # --- Step 1: Get frame-by-frame status for all individuals in the "Center Zone" ---
-    # Stores in_zone mask and original frame indices for each individual in the center zone
-    ind_zone_statuses = {
-        'individual1': {},
-        'individual2': {},
-        'individual3': {}
-    }
+# --- 修改部分：对 DataFrame 进行时间范围切片 ---
+# 创建一个在指定时间范围内有效的布尔掩码
+# 注意：DataFrame的索引是0开始的帧号
+time_range_mask = (df.index >= start_frame_index) & (df.index < end_frame_index)
 
-    # Iterate through each individual and the single "Center Zone"
-    for ind_prefix in ind_zone_statuses.keys():
-        for zone_name, details in zones.items():  # This will iterate only once for "中心区域"
-            x_coords, y_coords, in_zone_mask, original_frames = get_individual_zone_status(
-                df_filtered, ind_prefix, details, bodyparts_to_consider_for_each_individual, likelihood_threshold
-            )
-            if not in_zone_mask.empty:
-                ind_zone_statuses[ind_prefix][zone_name] = {
-                    'in_zone_mask': in_zone_mask,
-                    'original_frames': original_frames
-                }
+# 使用这个掩码来过滤数据，只分析指定时间段内的行为
+df_filtered = df[time_range_mask].copy()
 
-    # --- Step 2: Apply exclusivity logic and calculate dwelling time ---
-    all_individuals = ['individual1', 'individual2', 'individual3']
-    all_total_times = {ind: {} for ind in all_individuals}
 
-    # 1) Build "occupancy table" for each zone: rows = original frame indices, columns = individuals,
-    #    values = whether the individual is in that zone for that frame
-    zone_occupancy = {}
-    for zone_name in zones:  # This will run only for "中心区域"
-        # The index should be aligned with df_filtered's index, as we are only concerned with frames within df_filtered
-        occ_df = pd.DataFrame(False, index=df_filtered.index, columns=all_individuals)
-        for ind in all_individuals:
-            if zone_name in ind_zone_statuses[ind]:
-                frames = ind_zone_statuses[ind][zone_name]['original_frames']  # This is a list
-                mask = ind_zone_statuses[ind][zone_name]['in_zone_mask']  # This is a pandas Series
+# 重新计算在每个区域的总帧数，但现在基于过滤后的数据
+total_frames_center_zone = df_filtered['in_center_zone'].sum()
+total_frames_open_arm = df_filtered['in_open_arm'].sum()
 
-                # Convert frames (list) to Series to use isin()
-                frames_series = pd.Series(frames)
-                # Filter frames that are both in frames_series and in occ_df's index
-                valid_frames_in_occ_df = frames_series[frames_series.isin(occ_df.index)]
+# 计算总停留时间（秒）
+time_in_center_zone_sec = total_frames_center_zone * frame_interval_sec
+time_in_open_arm_sec = total_frames_open_arm * frame_interval_sec
 
-                # Use loc and reindex to ensure mask alignment.
-                # The original mask's index is already the original frame indices, so we can directly use .loc
-                # Only assign values for indices present in both valid_frames_in_occ_df and mask.index
-                occ_df.loc[valid_frames_in_occ_df, ind] = mask.loc[valid_frames_in_occ_df].values
+print(f"\n分析结果 ({analysis_start_sec:.2f}s - {analysis_end_sec:.2f}s):")
+print(f"在中心区停留的总时间: {time_in_center_zone_sec:.2f} 秒")
+print(f"在开放臂停留的总时间: {time_in_open_arm_sec:.2f} 秒")
 
-        zone_occupancy[zone_name] = occ_df  # This occ_df now contains only frames within the filtered time period
+# 记录每次进入的时间（首次进入或从其他区域进入）
+# 同样，基于过滤后的数据进行迭代，并调整时间戳
+center_zone_entries = []
+in_center_prev = False
+# 遍历过滤后的DataFrame的索引，并计算实际时间
+for i, in_center_curr in df_filtered['in_center_zone'].items():
+    current_frame_actual_index = i # 这是原始DataFrame中的帧号
+    if in_center_curr and not in_center_prev:
+        center_zone_entries.append(current_frame_actual_index * frame_interval_sec)
+    in_center_prev = in_center_curr
 
-    # 2) Calculate dwelling time after exclusivity for each individual and zone
-    for ind in all_individuals:
-        for zone_name, details in zones.items():  # This will run only for "中心区域"
-            # If no data for this individual in this zone within the filtered time period, set to zero
-            if zone_name not in ind_zone_statuses[ind]:
-                all_total_times[ind][zone_name] = 0.0
-                continue
+print(f"\n每次进入中心区的时间点 (秒) ({analysis_start_sec:.2f}s - {analysis_end_sec:.2f}s):")
+print([f"{t:.2f}" for t in center_zone_entries[:10]] + (['...'] if len(center_zone_entries) > 10 else []))
 
-            raw_mask = ind_zone_statuses[ind][zone_name]['in_zone_mask']
-            raw_frames = ind_zone_statuses[ind][zone_name]['original_frames']
+open_arm_entries = []
+in_open_prev = False
+for i, in_open_curr in df_filtered['in_open_arm'].items():
+    current_frame_actual_index = i # 这是原始DataFrame中的帧号
+    if in_open_curr and not in_open_prev:
+        open_arm_entries.append(current_frame_actual_index * frame_interval_sec)
+    in_open_prev = in_open_curr
 
-            occ_df_for_zone = zone_occupancy[
-                zone_name]  # This occupancy table already contains frames within the filtered time period
+print(f"\n每次进入开放臂的时间点 (秒) ({analysis_start_sec:.2f}s - {analysis_end_sec:.2f}s):")
+print([f"{t:.2f}" for t in open_arm_entries[:10]] + (['...'] if len(open_arm_entries) > 10 else []))
+# 计算在每个区域的总帧数
+total_frames_center_zone = df['in_center_zone'].sum()
+total_frames_open_arm = df['in_open_arm'].sum()
 
-            # Construct the mask for "only the current individual occupies the zone in this frame"
-            # Condition 1: Only 1 animal in the zone for this frame -> occ_df_for_zone.sum(axis=1)==1
-            # Condition 2: The current individual is in the zone for this frame -> occ_df_for_zone[ind]==True
-            exclusive_full = (occ_df_for_zone.sum(axis=1) == 1) & (occ_df_for_zone[ind])
+# 计算总停留时间（秒）
+time_in_center_zone_sec = total_frames_center_zone * frame_interval_sec
+time_in_open_arm_sec = total_frames_open_arm * frame_interval_sec
 
-            # Map back to the "cleaned" frame sequence (from raw_frames)
-            # Both exclusive_full and raw_frames should be within the same filtered time period
-            final_mask_series = exclusive_full.reindex(raw_frames)
-            final_mask = final_mask_series.fillna(False)  # Fill NaNs (frames not in exclusive_full) with False
+print(f"\n分析结果:")
+print(f"在中心区停留的总时间: {time_in_center_zone_sec:.2f} 秒")
+print(f"在开放臂停留的总时间: {time_in_open_arm_sec:.2f} 秒")
 
-            _, total_time = calculate_zone_dwelling_time(
-                final_mask,
-                raw_frames,
-                fps,
-                ind,
-                zone_name
-            )
-            all_total_times[ind][zone_name] = total_time
+# 记录每次进入的时间（首次进入或从其他区域进入）
+center_zone_entries = []
+in_center_prev = False
+for i, in_center_curr in enumerate(df['in_center_zone']):
+    if in_center_curr and not in_center_prev:
+        center_zone_entries.append(i * frame_interval_sec)
+    in_center_prev = in_center_curr
 
-    # Finally, print summary
-    print("\n===== 汇总结果 =====")  # ===== Summary Results =====
-    for ind in all_individuals:
-        for zone_name in zones:
-            print(
-                f"{ind} 在 {zone_name} 总停留时间: {all_total_times[ind][zone_name]:.2f} 秒")  # {ind} total dwelling time in {zone_name}: {total_time:.2f} seconds
+print(f"\n每次进入中心区的时间点 (秒):")
+print([f"{t:.2f}" for t in center_zone_entries[:10]] + (['...'] if len(center_zone_entries) > 10 else []))
 
-    # Overall summary
-    print(
-        f"\n\n========== 整体汇总 (文件: {file_to_analyze}, 使用重心点) ==========")  # ========== Overall Summary (File: {file_to_analyze}, using centroid) ==========
-    for zone_name in zones.keys():
-        print(
-            f"个体 1 在 {zone_name} 总停留时间: {all_total_times['individual1'].get(zone_name, 0.0):.2f} 秒")  # Individual 1 total dwelling time in {zone_name}: {total_time:.2f} seconds
-        print(
-            f"个体 2 在 {zone_name} 总停留时间: {all_total_times['individual2'].get(zone_name, 0.0):.2f} 秒")  # Individual 2 total dwelling time in {zone_name}: {total_time:.2f} seconds
-        print(
-            f"个体 3 在 {zone_name} (排他性条件) 总停留时间: {all_total_times['individual3'].get(zone_name, 0.0):.2f} 秒")  # Individual 3 total dwelling time in {zone_name} (exclusive condition): {total_time:.2f} seconds
+open_arm_entries = []
+in_open_prev = False
+for i, in_open_curr in enumerate(df['in_open_arm']):
+    if in_open_curr and not in_open_prev:
+        open_arm_entries.append(i * frame_interval_sec)
+    in_open_prev = in_open_curr
+
+print(f"\n每次进入开放臂的时间点 (秒):")
+print([f"{t:.2f}" for t in open_arm_entries[:10]] + (['...'] if len(open_arm_entries) > 10 else []))
+
+# ... (前面的代码保持不变，包括用户输入分析时间范围的逻辑) ...
+
+print(f"\n分析结果 ({analysis_start_sec:.2f}s - {analysis_end_sec:.2f}s):")
+print(f"在中心区停留的总时间: {time_in_center_zone_sec:.2f} 秒")
+print(f"在开放臂停留的总时间: {time_in_open_arm_sec:.2f} 秒")
+
